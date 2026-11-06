@@ -1,0 +1,410 @@
+import { HttpCrawler } from "@crawlee/http";
+import { ActorType } from "@hlidac-shopu/actors-common/actor-type.js";
+import { getInput, restPageUrls } from "@hlidac-shopu/actors-common/crawler.js";
+import { parseHTML } from "@hlidac-shopu/actors-common/dom.js";
+import { uploadToKeboola } from "@hlidac-shopu/actors-common/keboola.js";
+import { cleanPrice } from "@hlidac-shopu/actors-common/product.js";
+import Rollbar from "@hlidac-shopu/actors-common/rollbar.js";
+import { withPersistedStats } from "@hckr_/apify-persistent-stats";
+import { itemSlug } from "@hlidac-shopu/lib/shops.mjs";
+import { Dataset, LogLevel, log } from "apify";
+
+/** @typedef {import("linkedom/types/interface/document").Document} Document */
+
+/** @enum {string} */
+const Country = {
+  CZ: "CZ",
+  SK: "SK"
+};
+
+/** @enum {string} */
+const Labels = {
+  Start: "START",
+  Pagination: "PAGINATION",
+  Page: "PAGE",
+  PageBF: "PAGE_BF"
+};
+
+/** @enum {string} */
+const StartUrls = {
+  CZ: "https://nakup.itesco.cz/shop/cs-CZ/landing/groceries",
+  SK: "https://potravinydomov.itesco.sk/shop/sk-SK/landing/groceries"
+};
+
+/**
+ * Map of non-clubcard sale text parsers. Get the appropriate parser by country.
+ * The new MFE state exposes promotion descriptions as e.g. "33%, předtím 29.90 Kč",
+ * so the regex matches just the "předtím / predtým" part of the original contract.
+ * @type {Record<Country, (offerText: string) => { originalPrice: number } | null>}
+ */
+const saleParsers = {
+  [Country.CZ]: offerText => {
+    const matched = /předtím\s+([\d,.]+)\s*Kč/.exec(offerText);
+    if (!matched) return null;
+    return { originalPrice: cleanPrice(matched[1]) };
+  },
+  [Country.SK]: offerText => {
+    const matched = /predtým\s+([\d,.]+)\s*€/.exec(offerText);
+    if (!matched) return null;
+    return { originalPrice: cleanPrice(matched[1]) };
+  }
+};
+
+/**
+ * Parse the MFE state blob embedded in every nakup.itesco.cz page as a
+ * <script type="application/discover+json"> element.
+ * @param {Document} document
+ */
+function parseDiscoverJson(document) {
+  const script = document.querySelector('script[type="application/discover+json"]');
+  if (!script) return null;
+  try {
+    return JSON.parse(script.textContent);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Walk the data-plp-breadcrumb JSON tree and return the trail of text nodes
+ * from root to the current:true leaf. Mirrors what the old `.breadcrumbs ol li`
+ * DOM selector used to yield: a flat array of breadcrumb strings for the page.
+ */
+function breadcrumbTrail(nodes) {
+  if (!Array.isArray(nodes)) return [];
+  for (const node of nodes) {
+    if (node?.current) {
+      const deeper = breadcrumbTrail(node.children);
+      return [node.text, ...deeper];
+    }
+    const deeper = breadcrumbTrail(node?.children);
+    if (deeper.length) return [node.text, ...deeper];
+  }
+  return [];
+}
+
+/**
+ * @param {Document} document
+ * @returns {string[]}
+ */
+function extractCategoryBreadcrumb(document) {
+  const el = document.querySelector("[data-plp-breadcrumb]");
+  if (!el) return [];
+  try {
+    const data = JSON.parse(el.getAttribute("data-plp-breadcrumb"));
+    return breadcrumbTrail(data).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Read the total product count for the current category page from the MFE
+ * state. Used by the pagination handler to derive the page count (replacing
+ * the old `.pagination--page-selector-wrapper ul li` DOM parsing).
+ * @param {Document} document
+ * @returns {{ total: number, pageSize: number } | null}
+ */
+function extractPageInfo(document) {
+  const discover = parseDiscoverJson(document);
+  const rootQuery = discover?.["mfe-orchestrator"]?.props?.apolloCache?.ROOT_QUERY ?? {};
+  for (const [key, value] of Object.entries(rootQuery)) {
+    if (key.startsWith("category(") && value?.info?.total != null) {
+      return { total: value.info.total, pageSize: value.info.count || 24 };
+    }
+  }
+  return null;
+}
+
+const toPrice = value => (typeof value === "number" ? value : cleanPrice(value));
+
+/**
+ * Loose produce is listed per average piece (`price.actual` = `price.unitPrice` * `averageWeight`),
+ * but its "předtím" promo price is per kg. Catch-weight products are listed per kg.
+ * @param {object} product ProductType from the apollo cache
+ * @param {number | undefined} originalPrice parsed from the non-Clubcard promo text
+ */
+export function extractPrices(product, originalPrice) {
+  const price = product.price ?? {};
+  const result = {
+    currentPrice: toPrice(price.actual),
+    currentUnitPrice: toPrice(price.unitPrice),
+    discounted: false,
+    useUnitPrice: product.productType === "LooseProduce" || product.productType === "CatchWeightProducts"
+  };
+  if (originalPrice) {
+    result.discounted = true;
+    result.originalPrice = originalPrice;
+  }
+  if (result.useUnitPrice) {
+    result.unitOfMeasure = price.unitOfMeasure;
+    result.originalUnitPrice = originalPrice;
+    if (originalPrice && product.productType === "LooseProduce") {
+      result.originalPrice = Math.round(originalPrice * product.averageWeight * 100) / 100;
+    }
+  }
+  return result;
+}
+
+function extractItems({ document, country, uniqueItems, stats }) {
+  const rootUrl = country === Country.CZ ? "https://nakup.itesco.cz" : "https://potravinydomov.itesco.sk";
+  const locale = country === Country.CZ ? "cs-CZ" : "sk-SK";
+  const category = extractCategoryBreadcrumb(document);
+
+  const discover = parseDiscoverJson(document);
+  const apolloCache = discover?.["mfe-orchestrator"]?.props?.apolloCache ?? {};
+
+  // Resolve each ProductType.promotions ref to its description via the cache.
+  const resolvePromo = ref => {
+    if (!ref) return null;
+    const key = ref.__ref ?? (typeof ref === "string" ? ref : null);
+    if (!key) return null;
+    return apolloCache[key] ?? null;
+  };
+
+  const results = [];
+  for (const [key, product] of Object.entries(apolloCache)) {
+    if (!key.startsWith("ProductType:")) continue;
+    if (!product || typeof product !== "object") continue;
+
+    const itemId = parseInt(product.id);
+    if (!itemId || uniqueItems.has(itemId)) continue;
+
+    // Find the first non-Clubcard promotion (matching the old `.offer-text`
+    // filter) and parse its description for the original price.
+    const offerText = (product.promotions ?? [])
+      .map(resolvePromo)
+      .map(promo => promo?.description)
+      .find(desc => desc && !desc.includes("Clubcard"));
+    const saleData = offerText ? saleParsers[country](offerText) : null;
+
+    const result = {
+      itemId,
+      category,
+      currency: country === Country.CZ ? "CZK" : "EUR",
+      ...extractPrices(product, saleData?.originalPrice),
+      itemUrl: `${rootUrl}/shop/${locale}/products/${product.id}`
+    };
+
+    result.itemName = product.title;
+    result.img = product.defaultImageUrl;
+    result.inStock = product.status === "AvailableForSale";
+
+    if (!result.currentPrice && result.inStock) {
+      log.error("Missing price", result);
+    }
+
+    uniqueItems.add(result.itemId);
+    results.push(result);
+  }
+
+  // stats.offers previously accumulated `results.count` (per-page item count)
+  // once per handler call. Match that semantic: add the number of items
+  // emitted from this page.
+  stats.add("offers", results.length);
+
+  return results;
+}
+
+/**
+ * Extract top-level category URLs from the groceries homepage. Replaces the
+ * old `.menu__link--superdepartment` DOM class (removed in the ddsweb
+ * migration) with an href regex matching `/shop/<locale>/browse/<slug>/all`
+ * filtered to top-level superdepartments (exactly one slug segment).
+ * The whole URL scheme moved from `/groceries/<locale>/shop/…` to
+ * `/shop/<locale>/browse/…` (old paths only 301-redirect), so the old pattern
+ * matched nothing and the START handler queued zero categories.
+ * @param {Document} document
+ * @param {Country} country
+ */
+function startUrls(document, country) {
+  const rootUrl = country === Country.CZ ? "https://nakup.itesco.cz" : "https://potravinydomov.itesco.sk";
+  const locale = country === Country.CZ ? "cs-CZ" : "sk-SK";
+  const pattern = new RegExp(`^(?:https?://[^/]+)?(/shop/${locale}/browse/[^/?#]+/all)(?:[?#]|$)`);
+  const seen = new Set();
+  const hrefs = [];
+  for (const a of document.querySelectorAll("a[href]")) {
+    const href = (a.getAttribute("href") ?? "").trim();
+    const m = pattern.exec(href);
+    if (!m) continue;
+    const url = `${rootUrl}${m[1]}`;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    hrefs.push(url);
+  }
+  return hrefs;
+}
+
+/**
+ * @param {string} url
+ * @param {number|null} lastPage
+ * @returns {string[]|undefined}
+ */
+function pagesUrls(url, lastPage) {
+  const parsedLastPage = parseInt(lastPage);
+  if (parsedLastPage > 1) {
+    return restPageUrls(parsedLastPage, page => `${url}?page=${page}`);
+  }
+}
+
+/**
+ * @param {string} country
+ * @param {ActorType} type
+ */
+function getTableName(country, type) {
+  const tableName = country === Country.CZ ? "itesco" : "itesco_sk";
+  if (type === ActorType.BlackFriday) {
+    return `${tableName}_bf`;
+  }
+  return tableName;
+}
+
+async function startCrawler(crawler, { type, country, bfUrl, testUrl }) {
+  let startingRequest;
+  if (type === ActorType.BlackFriday) {
+    startingRequest = {
+      url: bfUrl,
+      userData: { label: Labels.PageBF }
+    };
+  } else if (type === ActorType.Test) {
+    startingRequest = {
+      url: testUrl,
+      userData: { label: Labels.Page }
+    };
+  } else {
+    // Default (Full, Daily, and any other non-BF/non-Test value) — full catalog crawl.
+    startingRequest = {
+      url: country === Country.CZ ? StartUrls.CZ : StartUrls.SK,
+      userData: { label: Labels.Start }
+    };
+  }
+  await crawler.run([startingRequest]);
+}
+
+/**
+ * @param {Document} document
+ * @param {Country} country
+ */
+function extractBFItems(document, country) {
+  return document.querySelectorAll(".a-productListing__productsGrid__element").map(el => {
+    const itemUrl = el.querySelector("a.ghs-link")?.getAttribute("href");
+    if (!itemUrl) {
+      return;
+    }
+    const originalPrice =
+      parseFloat(el.querySelector(".product__old-price")?.innerText.trim().replace(",", "").replace(/\s+/g, "")) / 100;
+    const currentPrice = parseFloat(el.querySelector(".product__price ")?.innerText.trim().replace(/\s+/g, "")) / 100;
+    log.info(`Found  ${itemUrl}`);
+    return {
+      itemId: itemSlug(itemUrl),
+      itemUrl,
+      itemName: el.querySelector(".product__name")?.innerText,
+      img: `https://itesco.${country.toLowerCase()}${el.querySelector(".product__img-wrapper img")?.getAttribute("data-src")}`,
+      originalPrice,
+      currentPrice,
+      discounted: originalPrice ? originalPrice > currentPrice : false,
+      category: country.toLowerCase() === "cz" ? ["Speciální nabídky"] : ["Špeciálne ponuky"],
+      currency: country.toLowerCase() === "cz" ? "CZK" : "EUR"
+    };
+  });
+}
+
+export async function main() {
+  Rollbar.init();
+
+  const stats = await withPersistedStats({
+    offers: 0,
+    failed: 0
+  });
+  const uniqueItems = new Set();
+
+  const {
+    development,
+    maxRequestRetries = 5,
+    country = Country.CZ,
+    type = ActorType.Full,
+    // TODO: use urls = []; instead
+    bfUrl = "https://itesco.cz/akcni-nabidky/seznam-produktu/black-friday/",
+    testUrl = "https://nakup.itesco.cz/shop/cs-CZ/browse/pekarna/all"
+  } = await getInput();
+
+  if (development) {
+    log.setLevel(LogLevel.DEBUG);
+  }
+
+  const crawler = new HttpCrawler({
+    maxRequestRetries,
+    // Akamai on nakup.itesco.cz aggressively throttles IPs that sustain more
+    // than ~1 req/s without a real-browser behavioral signal. Keep the per-IP
+    // rate under that ceiling; session pool + cookie persistence gives Akamai
+    // a consistent identity to meter against.
+    maxRequestsPerMinute: 60,
+    maxConcurrency: 2,
+    requestHandlerTimeoutSecs: 60,
+    useSessionPool: true,
+    persistCookiesPerSession: true,
+    sessionPoolOptions: {
+      sessionOptions: {
+        maxErrorScore: 1
+      }
+    },
+    async requestHandler({ request, crawler, log, body, session }) {
+      log.info(`Processing ${request.url}, ${request.userData.label}`);
+      const html = body.toString();
+      // Detect Akamai sensor-challenge body (stealth 200 with no real content)
+      // and retire the session so Crawlee retries against a fresh one.
+      if (html.includes("sec-if-cpt-container")) {
+        session?.retire();
+        throw new Error(`Akamai bot challenge for ${request.url}`);
+      }
+      const { document } = parseHTML(html);
+
+      switch (request.userData.label) {
+        case Labels.Start: {
+          const urls = startUrls(document, country);
+          log.debug(`Found ${urls.length} top-level categories on ${request.url}`);
+          await crawler.addRequests(urls.map(url => ({ url, userData: { label: Labels.Page } })));
+          break;
+        }
+        case Labels.Page: {
+          const pageInfo = extractPageInfo(document);
+          const lastPage = pageInfo ? Math.ceil(pageInfo.total / pageInfo.pageSize) : null;
+          const paginationUrls = pagesUrls(request.url, lastPage);
+          if (paginationUrls) {
+            log.debug(`Found ${paginationUrls.length} pagination pages on ${request.url}`);
+            await crawler.addRequests(paginationUrls.map(url => ({ url, userData: { label: Labels.Pagination } })));
+          }
+          const items = extractItems({ document, country, uniqueItems, stats });
+          await Dataset.pushData(items);
+          break;
+        }
+        case Labels.PageBF: {
+          const lastPage = document.querySelector(".ddl_plp_pagination .page a:last-child")?.innerText?.trim();
+          const paginationUrls = pagesUrls(request.url, lastPage);
+          if (paginationUrls) {
+            await crawler.addRequests(paginationUrls.map(url => ({ url, userData: { label: Labels.PageBF } })));
+          }
+          const items = extractBFItems(document, country);
+          await Dataset.pushData(items);
+          break;
+        }
+        case Labels.Pagination: {
+          const items = extractItems({ document, country, uniqueItems, stats });
+          log.debug(`Found ${items.length} items on ${request.url}`);
+          await Dataset.pushData(items);
+          break;
+        }
+      }
+    },
+    failedRequestHandler({ request, log }, error) {
+      log.error(`Request ${request.url} failed multiple times`, error);
+      stats.inc("failed");
+    }
+  });
+
+  await startCrawler(crawler, { type, country, bfUrl, testUrl });
+  await stats.save(true);
+
+  await uploadToKeboola(getTableName(country, type));
+  log.info("upload to Keboola finished");
+}
